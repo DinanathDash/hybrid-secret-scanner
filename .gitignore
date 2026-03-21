@@ -1,5 +1,6 @@
 # Ignore the massive dataset and meta folders
 resources/
+ml_pipeline/qlora_dataset_master.jsonl
 
 # Ignore Python cache folders and compiled files anywhere in the project
 __pycache__/

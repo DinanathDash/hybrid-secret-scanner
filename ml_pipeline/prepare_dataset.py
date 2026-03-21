@@ -21,25 +21,45 @@ def process_single_csv(csv_path: Path, source_code_dir: Path, dataset: list) -> 
     
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
-        for row in reader:
-            target_file = source_code_dir / row['FilePath']
+        for i, row in enumerate(reader):
+            # 1. Clean up the string from the CSV
+            file_path_str = row['FilePath'].strip().replace('\\', '/')
             
+            # If the CSV hardcoded "data/" at the front, strip it off
+            if file_path_str.startswith('data/'):
+                file_path_str = file_path_str[5:]
+            elif file_path_str.startswith('/data/'):
+                file_path_str = file_path_str[6:]
+                
+            # 2. Smart Path Resolution
+            if file_path_str.startswith(csv_path.stem):
+                target_file = source_code_dir / file_path_str
+            else:
+                target_file = source_code_dir / csv_path.stem / file_path_str
+                
             if not target_file.exists():
                 skipped += 1
                 continue
                 
+            # Safely extract the secret string and category
+            raw_secret_str = row.get('Secret') or row.get('Value') or row.get('RawSecret') or ""
+            category_str = row.get('Rule') or row.get('Category') or "UNKNOWN"
+
             # Map Samsung's CSV columns to our DataClass
             candidate = CandidateSecret(
                 file_path=target_file,
                 line_number=int(row['LineStart']), 
-                raw_secret=row['Value'],           
-                secret_category=row['Rule'],       
-                entropy=calculate_dummy_entropy(row['Value'])
+                raw_secret=raw_secret_str,           
+                secret_category=category_str,       
+                entropy=calculate_dummy_entropy(raw_secret_str)
             )
             
-            # Process using our core logic
+            # THE MISSING LINE: Process using our core logic
             processed_candidate = extract_and_redact_context(candidate)
-            is_genuine = row['IsSecret'].strip().upper() == 'T'
+            
+            # Safely extract the truth label
+            truth_str = str(row.get('GroundTruth') or row.get('IsSecret') or row.get('Label') or row.get('ground_truth') or 'F').strip().upper()
+            is_genuine = truth_str in ['T', 'TRUE', '1']
             
             # Format Expected Output to match our Pydantic Schema
             expected_output = {
