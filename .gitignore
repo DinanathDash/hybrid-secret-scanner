@@ -1,0 +1,17 @@
+# Ignore the massive dataset and meta folders
+resources/
+
+# Ignore Python cache folders and compiled files anywhere in the project
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+
+# Ignore virtual environments (if you decide to use one later)
+venv/
+env/
+
+# Ignore IDE specific folders (optional but good practice)
+.vscode/
+.idea/
