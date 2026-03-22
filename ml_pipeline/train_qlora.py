@@ -3,9 +3,13 @@ from unsloth import FastLanguageModel
 from datasets import load_dataset
 from trl import SFTTrainer
 from transformers import TrainingArguments
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
 
 # 1. Model Configuration (Optimized for 8GB VRAM)
-max_seq_length = 2048 # 2048 is plenty for our 15-line code snippets
+max_seq_length = 512 # Ultra-tight memory profile
 dtype = None          
 load_in_4bit = True   # CRITICAL: This shrinks the 8B model to ~5.7GB
 
@@ -20,13 +24,12 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 # 2. Attach LoRA Adapters
 model = FastLanguageModel.get_peft_model(
     model,
-    r = 16, 
+    r = 8,              # <-- CHANGE THIS FROM 16 TO 8
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
                       "gate_proj", "up_proj", "down_proj",],
-    lora_alpha = 16,
+    lora_alpha = 8,     # <-- CHANGE THIS FROM 16 TO 8
     lora_dropout = 0, 
     bias = "none",    
-    # CRITICAL FOR 8GB VRAM: Unsloth's checkpointing saves massive amounts of memory
     use_gradient_checkpointing = "unsloth", 
     random_state = 3407,
 )
@@ -70,8 +73,8 @@ trainer = SFTTrainer(
     dataset_num_proc = 2,
     packing = False, 
     args = TrainingArguments(
-        per_device_train_batch_size = 2, # Keep this low for 8GB VRAM
-        gradient_accumulation_steps = 4, # Simulates a batch size of 8
+        per_device_train_batch_size = 1, # Keep this low for 8GB VRAM
+        gradient_accumulation_steps = 8, # Simulates a batch size of 8
         warmup_steps = 5,
         max_steps = 60, # UNCOMMENT this to do a quick 5-minute test run to make sure it doesn't crash!
         num_train_epochs = 1, # Does one full pass over your 27,000 examples
@@ -79,7 +82,7 @@ trainer = SFTTrainer(
         fp16 = not torch.cuda.is_bf16_supported(),
         bf16 = torch.cuda.is_bf16_supported(),
         logging_steps = 10,
-        optim = "adamw_8bit", # Uses 8-bit optimizer to save even more VRAM
+        optim = "paged_adamw_8bit", # Uses 8-bit optimizer to save even more VRAM
         weight_decay = 0.01,
         lr_scheduler_type = "linear",
         seed = 3407,
@@ -89,6 +92,7 @@ trainer = SFTTrainer(
 
 # 5. Start Training
 print("Starting QLoRA Fine-Tuning...")
+torch.cuda.empty_cache()
 trainer_stats = trainer.train()
 
 # 6. Save the resulting LoRA Adapter
