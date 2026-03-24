@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-secret-scanner"
+version = "0.1.0"
+description = "Hybrid secret scanning pipeline with regex + LLM verification"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["."]
+filterwarnings = [
+  "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+  "ignore:.*asyncio.get_event_loop_policy.*:DeprecationWarning:pytest_asyncio.plugin",
+  "ignore:.*asyncio.set_event_loop_policy.*:DeprecationWarning:pytest_asyncio.plugin",
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312", "py313"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+  "mlx_env",
+  "ml_env",
+  "ml_pipeline/mlx_dataset",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = false
+exclude = ["mlx_env", "ml_env", "ml_pipeline/mlx_dataset"]

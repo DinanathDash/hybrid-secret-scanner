@@ -1,9 +1,11 @@
-import pytest
-from unittest.mock import patch
 from pathlib import Path
+from unittest.mock import patch
 
-from src.models import CandidateSecret, LLMResponse
+import pytest
+
 from src.llm_engine import evaluate_candidate
+from src.models import CandidateSecret, LLMResponse
+
 
 @pytest.fixture
 def dummy_candidate():
@@ -14,8 +16,9 @@ def dummy_candidate():
         secret_category="AWS_ACCESS_KEY",
         entropy=3.5,
         sanitized_context="aws_key = '<REDACTED>'",
-        variable_name="aws_key"
+        variable_name="aws_key",
     )
+
 
 @pytest.mark.asyncio
 async def test_evaluate_candidate_success(dummy_candidate):
@@ -24,24 +27,29 @@ async def test_evaluate_candidate_success(dummy_candidate):
         is_genuine_secret=True,
         confidence_score=0.95,
         remediation_priority="CRITICAL",
-        reasoning="Looks like a real AWS key in production code."
+        reasoning="Looks like a real AWS key in production code.",
     )
-    
-    with patch('src.llm_engine._invoke_llm_with_retry', return_value=mock_response):
+
+    class _FakeScanner:
+        def analyze_candidate(self, _candidate):
+            return mock_response
+
+    with patch("src.llm_engine.get_scanner", return_value=_FakeScanner()):
         result = await evaluate_candidate(dummy_candidate)
-        
+
     assert result.is_genuine_secret is True
     assert result.remediation_priority == "CRITICAL"
     assert result.confidence_score == 0.95
 
+
 @pytest.mark.asyncio
 async def test_evaluate_candidate_graceful_degradation(dummy_candidate):
-    # Mock a catastrophic failure (e.g., Ollama is offline)
-    with patch('src.llm_engine._invoke_llm_with_retry', side_effect=Exception("Connection Refused")):
+    # Mock a catastrophic failure during scanner acquisition/inference.
+    with patch("src.llm_engine.get_scanner", side_effect=Exception("Connection Refused")):
         result = await evaluate_candidate(dummy_candidate)
-        
+
     # The fail-safe must catch this and return a safe default
     assert result.is_genuine_secret is True
     assert result.confidence_score == 0.0
     assert result.remediation_priority == "MANUAL_REVIEW_REQUIRED"
-    assert "LLM Inference failed" in result.reasoning
+    assert "LLM inference failed" in result.reasoning
