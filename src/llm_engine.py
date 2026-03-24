@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import warnings
 from typing import Any
 
@@ -11,6 +12,7 @@ from .models import CandidateSecret, LLMResponse
 
 CONFIRMED_SECRET_PRIORITIES = {"CRITICAL", "HIGH", "MEDIUM"}
 _SCANNER: HybridAIScanner | None = None
+_EFFECTIVE_MAX_TOKENS = 250
 
 
 class HybridAIScanner:
@@ -56,10 +58,9 @@ class HybridAIScanner:
             self.model,
             self.tokenizer,
             prompt=prompt,
-            max_tokens=LLM_MAX_TOKENS,
+            max_tokens=min(LLM_MAX_TOKENS, _EFFECTIVE_MAX_TOKENS),
         )
-        clean_json = raw_response.split("<|eot_id|>")[0].strip()
-        parsed = _parse_json_object(clean_json)
+        parsed = _parse_json_object(raw_response)
 
         priority = str(parsed.get("remediation_priority", "SAFE")).upper()
         if priority not in {
@@ -95,50 +96,90 @@ def get_scanner() -> HybridAIScanner:
 def _build_prompt(candidate: CandidateSecret) -> str:
     filename = candidate.file_path.name
     unredacted_code_snippet = candidate.sanitized_context or ""
-    prompt = f"""You are an elite Application Security Engineer. Your task is to analyze a code snippet and determine if it contains a LIVE, HIGH-RISK hardcoded secret.
-
-### Evaluation Rubric:
-1. SAFE (False Positives): UUIDs, CSS Hex colors, cryptographic public keys, empty strings, obvious placeholder/dummy values (e.g., 'test_key', 'admin123' in test context), and files ending in `.example` or `.md`.
-2. CRITICAL (True Positives): High-entropy, production-looking API keys, cloud provider tokens (AWS, GCP, Azure), database URIs with complex passwords, and private cryptographic keys assigned to active variables.
-
-Analyze the context (variable names, comments, filename) deeply.
+    prompt = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
 
 ### Instruction:
-Analyze the code snippet from '{filename}'. Output ONLY a valid JSON object. The "reasoning" key MUST come first so you can think step-by-step before determining the "remediation_priority".
+You are an elite Application Security Engineer. Analyze the code snippet from '{filename}' and output a valid JSON object. 
+IMPORTANT: Output ONLY valid, raw JSON. Do NOT wrap the JSON in markdown.
+
+Evaluation Rubric:
+- SAFE: UUIDs, CSS Hex colors, public keys, empty strings, placeholder/dummy values ('test_key', 'admin123' in test context), `.example` files, `.md` files, and environment variable retrievals (e.g., os.environ.get).
+- CRITICAL: High-entropy API keys, cloud provider tokens (AWS, GCP, Azure), database URIs with complex passwords assigned to active variables.
+
+### Example 1 (Safe Placeholder):
+Filename: docs/setup.md
+Code: api_key = "YOUR_API_KEY_HERE"
+Response:
+{{
+    "reasoning": "The file is markdown documentation and the value is an obvious placeholder.",
+    "is_genuine_secret": false,
+    "confidence_score": 0.99,
+    "remediation_priority": "SAFE"
+}}
+
+### Example 2 (Safe Environment Variable):
+Filename: src/config.py
+Code: aws_key = os.getenv("AWS_ACCESS_KEY_ID")
+Response:
+{{
+    "reasoning": "The code is securely loading the credential from an environment variable, not hardcoding it.",
+    "is_genuine_secret": false,
+    "confidence_score": 0.99,
+    "remediation_priority": "SAFE"
+}}
+
+The JSON format MUST exactly match the examples above.
+Stop immediately after the final closing brace.
 
 ### Input:
-{unredacted_code_snippet}
+Filename: {filename}
+Code: {unredacted_code_snippet}
 
 ### Response:
-{{
-    "reasoning": "step-by-step logic here...",
-    "is_genuine_secret": true/false,
-    "confidence_score": 0.0 to 1.0,
-    "remediation_priority": "CRITICAL|HIGH|MEDIUM|LOW|SAFE"
-}}"""
+{{"""
     return prompt
 
 
 def _parse_json_object(payload: str) -> dict[str, Any]:
-    """Parse model output robustly, including partial wrappers around JSON."""
+    """Parse model output robustly, extracting only the first JSON object."""
+    # Rebuild the opening brace that is prefilled in the prompt.
+    full_payload = payload if payload.lstrip().startswith("{") else "{" + payload
+
+    clean_text = full_payload.split("<|eot_id|>")[0].strip()
+
+    # Defensive guard: if redaction markers leak into output channels, ignore non-JSON prefixes.
+    redaction_idx = clean_text.find("<REDACTED_SECRET_LENGTH_")
+    first_brace_idx = clean_text.find("{")
+    if redaction_idx != -1 and (first_brace_idx == -1 or redaction_idx < first_brace_idx):
+        clean_text = clean_text[first_brace_idx:] if first_brace_idx != -1 else ""
+
+    # Drop hallucinated continuation sections (e.g., an extra "### Response:" block).
+    clean_text = clean_text.split("### Response:")[0].strip()
+
+    # If a second JSON object starts without a heading, keep only the first block.
+    if "\n\n{" in clean_text:
+        clean_text = clean_text.split("\n\n{", 1)[0].strip()
+
+    # Remove markdown fences if the model wraps the JSON in code blocks.
+    clean_text = re.sub(r"^```json\s*", "", clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r"^```\s*", "", clean_text)
+    clean_text = re.sub(r"\s*```$", "", clean_text)
+
+    start_idx = clean_text.find("{")
+    if start_idx != -1:
+        clean_text = clean_text[start_idx:]
+
     try:
-        parsed = json.loads(payload)
+        # Parse only the first complete JSON object and ignore any trailing junk.
+        parsed, end_idx = json.JSONDecoder().raw_decode(clean_text)
+        clean_text = clean_text[:end_idx]
         if isinstance(parsed, dict):
             return parsed
-        logging.warning("LLM returned non-object JSON payload: %s", payload)
+        logging.warning("LLM returned non-object JSON payload after cleaning: %s", clean_text)
         return {}
-    except json.JSONDecodeError:
-        start = payload.find("{")
-        end = payload.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                extracted = json.loads(payload[start : end + 1])
-                if isinstance(extracted, dict):
-                    return extracted
-            except json.JSONDecodeError:
-                logging.warning("Failed to parse extracted JSON object from LLM output: %s", payload)
-                return {}
-        logging.warning("Failed to parse LLM JSON output: %s", payload)
+    except json.JSONDecodeError as exc:
+        logging.warning("Failed to parse LLM JSON output after cleaning. Error: %s", exc)
+        logging.warning("Cleaned LLM output for debugging: %s", clean_text)
         return {}
 
 

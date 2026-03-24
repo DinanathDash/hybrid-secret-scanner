@@ -10,7 +10,8 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from cli_runtime import run_cli
-from src.llm_engine import HybridAIScanner
+import src.llm_engine as llm_engine
+from src.llm_engine import HybridAIScanner, get_scanner
 from src.models import CandidateSecret
 
 POSITIVE_PRIORITIES = {"CRITICAL", "HIGH", "MEDIUM"}
@@ -36,6 +37,12 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional cap on number of rows to evaluate (0 = all rows).",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=250,
+        help="Max output tokens per sample for eval speed (default: 250).",
     )
     return parser.parse_args()
 
@@ -91,7 +98,11 @@ def main() -> None:
     if not dataset_path.exists():
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    scanner = HybridAIScanner()
+    # Keep eval runs fast and deterministic regardless shell env values.
+    llm_engine.LLM_MAX_TOKENS = max(32, int(args.max_tokens))
+
+    # Explicitly re-use the singleton scanner for the full eval run.
+    scanner = get_scanner()
     matrix = ConfusionMatrix()
     total = 0
 

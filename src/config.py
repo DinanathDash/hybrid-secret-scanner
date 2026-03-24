@@ -11,7 +11,7 @@ def _as_bool(value: str | None, default: bool = False) -> bool:
 
 LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "mlx-community/Meta-Llama-3-8B-Instruct-4bit")
 LLM_ADAPTER_PATH = os.getenv("LLM_ADAPTER_PATH", "./adapters")
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "200"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "500"))
 LLM_DRY_RUN = _as_bool(os.getenv("LLM_DRY_RUN"), default=False)
 
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")

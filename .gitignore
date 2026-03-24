@@ -36,6 +36,7 @@ adapters/*.safetensors
 ml_pipeline/mlx_dataset/
 ml_pipeline/qlora_dataset_master.jsonl
 examples/golden_dataset.jsonl
+windows_ready_scanner
 
 # Notebook and logs
 *.ipynb_checkpoints
