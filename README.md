@@ -12,21 +12,19 @@ This project introduces a **Hybrid Detection Pipeline**:
 2. **Stage 2 (Context-Aware LLM Filtering):** Extracts the Abstract Syntax Tree (AST) context around the candidate and utilizes a fine-tuned LLM (Llama-3/Mistral) with Few-Shot Chain-of-Thought prompting to classify the string as a `TRUE_POSITIVE` or `FALSE_POSITIVE`.
 
 ## Repository Structure
-Ensure all project files adhere to this directory layout:
+Current high-level layout:
 
-* `data/` : Datasets (Do not commit large datasets to Git)
-  * `raw/` : Original CredData and FPSecretBench files
-  * `processed/` : Cleaned CSVs ready for LLM inference
-* `src/` : Core pipeline source code
-  * `scanner/` : Regex/Entropy baseline wrapper
-  * `llm_verifier/` : LLM API integration and prompt templates
-  * `ast_parser/` : Code block extraction logic
-  * `utils/` : Helper functions and logging
-* `experiments/` : Jupyter notebooks for baseline metrics and tuning
-* `reports/` : Output JSON/CSV reports from the pipeline
-* `main.py` : Primary CLI entry point
-* `requirements.txt` : Python dependencies
-* `README.md` : Project documentation
+* `main.py` : Primary hybrid scanner CLI
+* `ai_scanner.py` : LLM-backed verification logic
+* `cli_runtime.py` : Shared graceful CLI runtime helpers (`Ctrl+C`, buffering)
+* `src/` : Core reusable modules (`scanner`, context extraction, ingestion, models)
+* `tests/` : Unit tests for `src/`
+* `examples/` : Sample files for local scanning demos (`examples/dummy_app.py`)
+* `scripts/` : Operational helper scripts (dataset split, local AI smoke test)
+* `ml_pipeline/` : Dataset prep + fine-tuning utilities for QLoRA/MLX
+* `adapters/` : Local LoRA adapter artifacts (generated)
+* `reports/` : Local scan outputs (git-ignored except marker files)
+* `artifacts/` : Local experiment artifacts/checkpoints (git-ignored except marker files)
 
 ## Prerequisites
 * Python 3.10+
@@ -40,19 +38,43 @@ Ensure all project files adhere to this directory layout:
 2. Create and activate a virtual environment:
    `python -m venv venv`
    `source venv/bin/activate` (On Windows use `venv\Scripts\activate`)
-3. Install dependencies:
+3. Install runtime dependencies:
    `pip install -r requirements.txt`
-4. Configure environment variables:
-   Copy `.env.example` to `.env` and add your LLM API keys.
+4. Optional developer dependencies:
+   `pip install -r requirements-dev.txt`
+5. Optional training dependencies:
+   `pip install -r requirements-train.txt`
+6. Configure environment variables:
+   Copy `.env.example` to `.env` and adjust values as needed.
 
 ## Usage (CLI)
 The tool is designed to be executed via the command line for CI/CD pipeline simulation.
 
-**Run a baseline scan (Regex only):**
-`python main.py --mode baseline --target ./data/raw/sample_repo --output reports/baseline.json`
+**Run the hybrid local demo scanner:**
+`python main.py`
 
-**Run the full hybrid scan (Regex + LLM):**
-`python main.py --mode hybrid --target ./data/raw/sample_repo --model llama3-8b --output reports/hybrid_results.json`
+**Run local LLM smoke test helper:**
+`python scripts/test_ai.py`
+
+## Task Runner
+Use the Makefile for common workflows:
+
+* `make run` : run the main scanner demo
+* `make test` : run unit tests
+* `make smoke` : run entrypoint smoke tests
+* `make lint` : run Ruff checks
+* `make format` : apply formatting
+* `make typecheck` : run mypy
+* `make prep-mlx` : build MLX training dataset format
+* `make train-mlx` : launch MLX training wrapper
+* `make precommit-install` : install local git hooks
+
+## Environment Variables
+Core variables are documented in `.env.example`:
+
+* `LLM_MODEL_ID`, `LLM_ADAPTER_PATH`, `LLM_MAX_TOKENS`
+* `LLM_DRY_RUN` (set `true` to skip model loading/inference)
+* `OLLAMA_MODEL`, `OLLAMA_TEMPERATURE`, `OLLAMA_TIMEOUT_SECONDS`
 
 ## Datasets
 This research utilizes the following open-source datasets for experimental validation:

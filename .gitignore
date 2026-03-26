@@ -1,21 +1,47 @@
-# Ignore the massive dataset and meta folders
-resources/
-ml_pipeline/qlora_dataset_master.jsonl
-ml_env
-unsloth_compiled_cache/
+# OS metadata
+.DS_Store
 
-
-# Ignore Python cache folders and compiled files anywhere in the project
+# Python cache and tooling
 __pycache__/
+*.py[cod]
+*.so
 .pytest_cache/
-*.pyc
-*.pyo
-*.pyd
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
 
-# Ignore virtual environments (if you decide to use one later)
+# Virtual environments
+ml_env/
+mlx_env/
 venv/
 env/
+.venv/
 
-# Ignore IDE specific folders (optional but good practice)
+# Local secrets and overrides
+.env
+.env.*
+!.env.example
+*.local
+
+# ML artifacts / large generated files
+resources/
+unsloth_compiled_cache/
+outputs/
+secret_detection_lora/
+artifacts/*
+reports/*
+adapters/*.safetensors
+ml_pipeline/mlx_dataset/
+ml_pipeline/qlora_dataset_master.jsonl
+examples/golden_dataset.jsonl
+windows_ready_scanner
+
+# Notebook and logs
+*.ipynb_checkpoints
+*.log
+
+# IDE settings
 .vscode/
 .idea/
