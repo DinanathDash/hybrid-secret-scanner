@@ -1,47 +1,30 @@
-# OS metadata
-.DS_Store
-
-# Python cache and tooling
-__pycache__/
-*.py[cod]
-*.so
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# Virtual environments
-ml_env/
-mlx_env/
-venv/
-env/
-.venv/
-
-# Local secrets and overrides
-.env
-.env.*
-!.env.example
-*.local
-
-# ML artifacts / large generated files
-resources/
-unsloth_compiled_cache/
-outputs/
-secret_detection_lora/
-artifacts/*
-reports/*
-adapters/*.safetensors
-ml_pipeline/mlx_dataset/
-ml_pipeline/qlora_dataset_master.jsonl
-examples/golden_dataset.jsonl
-windows_ready_scanner
-
-# Notebook and logs
-*.ipynb_checkpoints
-*.log
-
-# IDE settings
+# IDEs Cache
 .vscode/
 .idea/
+
+# Node
+node_modules/
+.next/
+out/
+build/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+venv/
+env/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
