@@ -1,66 +1,19 @@
-import math
-import re
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Literal
 
 from src.ingestion import yield_scannable_files
 from src.models import CandidateSecret, LLMResponse
 
 from .context_extractor import extract_fixed_window_context
-from .llm_engine import evaluate_candidate
-
-# High-Recall Regex Patterns
-PATTERNS = {
-    "AWS_ACCESS_KEY": re.compile(r"(?i)\b(AKIA[0-9A-Z]{16})\b"),
-    "GITHUB_TOKEN": re.compile(
-        r"(?i)\b(ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59})\b"
-    ),
-    "DATABASE_URI": re.compile(
-        r"(?i)(mongodb(?:\+srv)?:\/\/[^\s'\"]+|postgres(?:ql)?:\/\/[^\s'\"]+)"
-    ),
-    "PRIVATE_KEY_OR_JWT": re.compile(
-        r"(?i)(-----BEGIN [A-Z ]+ PRIVATE KEY-----|eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,})"
-    ),
-}
+from .fast_scanner import heuristic_verdict, scan_file_for_secrets
+from .llm_engine import evaluate_candidate, get_llm_runtime_status
 
 
-def calculate_shannon_entropy(data: str) -> float:
-    """Calculates the Shannon entropy of a string."""
-    if not data:
-        return 0.0
-    entropy = 0.0
-    for x in set(data):
-        p_x = float(data.count(x)) / len(data)
-        entropy -= p_x * math.log(p_x, 2)
-    return entropy
-
-
-async def scan_file_for_secrets(file_path: Path) -> list[CandidateSecret]:
-    """Scans a single file line-by-line using regex heuristics."""
-    findings = []
-    try:
-        # Since ingestion.py filtered out massive files, standard open() is safe here.
-        with open(file_path, encoding="utf-8", errors="ignore") as f:
-            for line_number, line in enumerate(f, 1):
-                for category, pattern in PATTERNS.items():
-                    for match in pattern.finditer(line):
-                        # Extract the captured group if it exists, otherwise the full match
-                        secret_value = match.group(1) if match.groups() else match.group(0)
-                        entropy = calculate_shannon_entropy(secret_value)
-
-                        findings.append(
-                            CandidateSecret(
-                                file_path=file_path,
-                                line_number=line_number,
-                                raw_secret=secret_value,
-                                secret_category=category,
-                                entropy=entropy,
-                            )
-                        )
-    except Exception:
-        # Silently skip files that trigger unexpected OS/read errors during scan
-        pass
-
-    return findings
+class FullScanError(Exception):
+    def __init__(self, message: str, logs: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.logs = logs or []
 
 
 async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResponse]]:
@@ -79,7 +32,7 @@ async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResp
         return all_findings
 
     for file_path in file_paths:
-        secrets = await scan_file_for_secrets(file_path)
+        secrets = await scan_file_for_secrets(file_path, profile="full")
 
         for secret in secrets:
             # Build a strict 11-line window (target line +/- 5) for LLM context.
@@ -98,3 +51,56 @@ async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResp
             )
 
     return all_findings
+
+
+async def scan_snippet(
+    code: str,
+    filename: str = "snippet.txt",
+    scan_mode: Literal["fast", "full"] = "fast",
+) -> tuple[list[tuple[CandidateSecret, LLMResponse]], Literal["fast", "full"]]:
+    """
+    Scan an in-memory code snippet by writing it to a temporary file and
+    reusing the existing regex + LLM pipeline stages.
+    """
+    suffix = Path(filename).suffix if Path(filename).suffix else ".txt"
+    with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=suffix, delete=True) as tmp:
+        tmp.write(code)
+        tmp.flush()
+
+        file_path = Path(tmp.name)
+        findings: list[tuple[CandidateSecret, LLMResponse]] = []
+        candidate_profile: Literal["fast", "full"] = "full" if scan_mode == "full" else "fast"
+        secrets = await scan_file_for_secrets(file_path, profile=candidate_profile)
+        effective_mode: Literal["fast", "full"] = scan_mode
+
+        if scan_mode == "full":
+            llm_ready, llm_reason = get_llm_runtime_status()
+            if not llm_ready:
+                raise FullScanError(
+                    "Full scan failed before inference started.",
+                    logs=[
+                        "Requested mode: full",
+                        f"Runtime check failed: {llm_reason}",
+                        "Action: install and configure MLX runtime (`mlx_lm`) or run fast scan.",
+                    ],
+                )
+
+        for secret in secrets:
+            processed_secret = extract_fixed_window_context(secret, radius=5)
+            if effective_mode == "full":
+                try:
+                    verdict = await evaluate_candidate(processed_secret, strict=True)
+                except Exception as exc:
+                    raise FullScanError(
+                        "Full scan failed during model inference.",
+                        logs=[
+                            "Requested mode: full",
+                            f"Failure at {processed_secret.file_path.name}:{processed_secret.line_number}",
+                            str(exc),
+                        ],
+                    ) from exc
+            else:
+                verdict = heuristic_verdict(processed_secret)
+            findings.append((processed_secret, verdict))
+
+        return findings, effective_mode

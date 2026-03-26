@@ -1,18 +1,40 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
+import sys
+import time
 import warnings
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
-from .config import LLM_ADAPTER_PATH, LLM_DRY_RUN, LLM_MAX_TOKENS, LLM_MODEL_ID
+from .config import (
+    LLM_ADAPTER_PATH,
+    LLM_CACHE_ENABLED,
+    LLM_CACHE_MAX_ENTRIES,
+    LLM_DRY_RUN,
+    LLM_EFFECTIVE_MAX_TOKENS,
+    LLM_MAX_TOKENS,
+    LLM_MODEL_ID,
+    LLM_WARMUP_ON_START,
+)
 from .models import CandidateSecret, LLMResponse
 
 CONFIRMED_SECRET_PRIORITIES = {"CRITICAL", "HIGH", "MEDIUM"}
 _SCANNER: HybridAIScanner | None = None
-_EFFECTIVE_MAX_TOKENS = 250
+_EFFECTIVE_MAX_TOKENS = LLM_EFFECTIVE_MAX_TOKENS
+_LLM_RUNTIME_READY: bool | None = None
+_LLM_RUNTIME_REASON: str | None = None
+_WARMUP_DONE = False
+_WARMUP_MESSAGE = "Not warmed yet."
+_VERDICT_CACHE: OrderedDict[str, LLMResponse] = OrderedDict()
+_CACHE_HITS = 0
+_CACHE_MISSES = 0
 
 
 class HybridAIScanner:
@@ -93,51 +115,166 @@ def get_scanner() -> HybridAIScanner:
     return _SCANNER
 
 
+def get_llm_runtime_status() -> tuple[bool, str]:
+    """
+    Return whether full LLM inference can run in this process, with a reason.
+    This avoids repetitive per-finding failures/noise when mlx_lm is missing.
+    """
+    global _LLM_RUNTIME_READY, _LLM_RUNTIME_REASON
+
+    if LLM_DRY_RUN:
+        return False, "LLM_DRY_RUN is enabled."
+
+    if _LLM_RUNTIME_READY is not None and _LLM_RUNTIME_REASON is not None:
+        return _LLM_RUNTIME_READY, _LLM_RUNTIME_REASON
+
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c", "import mlx_lm; print('mlx_lm_ok')"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except Exception as exc:
+        _LLM_RUNTIME_READY = False
+        _LLM_RUNTIME_REASON = (
+            "LLM runtime probe failed unexpectedly. "
+            f"Full scan cannot proceed. Error: {exc}"
+        )
+        return _LLM_RUNTIME_READY, _LLM_RUNTIME_REASON
+
+    if probe.returncode != 0:
+        stderr = (probe.stderr or "").strip().splitlines()
+        detail = stderr[-1] if stderr else "unknown runtime import failure"
+        _LLM_RUNTIME_READY = False
+        _LLM_RUNTIME_REASON = (
+            "LLM runtime unavailable (`mlx_lm` probe failed). "
+            f"Full scan cannot proceed. Error: {detail}"
+        )
+    else:
+        _LLM_RUNTIME_READY = True
+        _LLM_RUNTIME_REASON = "LLM runtime ready."
+
+    return _LLM_RUNTIME_READY, _LLM_RUNTIME_REASON
+
+
+def warmup_llm_if_configured() -> tuple[bool, str]:
+    """Warm model once on server startup so later scans avoid cold start."""
+    global _WARMUP_DONE, _WARMUP_MESSAGE
+
+    if _WARMUP_DONE:
+        return True, _WARMUP_MESSAGE
+
+    if not LLM_WARMUP_ON_START:
+        _WARMUP_DONE = False
+        _WARMUP_MESSAGE = "Warmup disabled via LLM_WARMUP_ON_START."
+        return False, _WARMUP_MESSAGE
+
+    if LLM_DRY_RUN:
+        _WARMUP_DONE = False
+        _WARMUP_MESSAGE = "Warmup skipped because LLM_DRY_RUN is enabled."
+        return False, _WARMUP_MESSAGE
+
+    ready, reason = get_llm_runtime_status()
+    if not ready:
+        _WARMUP_DONE = False
+        _WARMUP_MESSAGE = f"Warmup skipped: {reason}"
+        return False, _WARMUP_MESSAGE
+
+    started = time.perf_counter()
+    try:
+        scanner = get_scanner()
+        # Run one tiny inference to warm kernels/caches, not just model load.
+        warm_candidate = CandidateSecret(
+            file_path=Path("warmup_snippet.py"),
+            line_number=1,
+            raw_secret="AKIA1A2B3C4D5E6F7G8H",
+            secret_category="AWS_ACCESS_KEY",
+            entropy=4.2,
+            sanitized_context='api_key = "AKIA1A2B3C4D5E6F7G8H"',
+            variable_name="api_key",
+        )
+        scanner.analyze_candidate(warm_candidate)
+    except Exception as exc:
+        _WARMUP_DONE = False
+        _WARMUP_MESSAGE = f"Warmup failed: {exc}"
+        return False, _WARMUP_MESSAGE
+
+    elapsed = round(time.perf_counter() - started, 3)
+    _WARMUP_DONE = True
+    _WARMUP_MESSAGE = f"Warmup complete in {elapsed}s."
+    return True, _WARMUP_MESSAGE
+
+
+def get_warmup_status() -> tuple[bool, str]:
+    return _WARMUP_DONE, _WARMUP_MESSAGE
+
+
+def get_cache_stats() -> dict[str, int | bool]:
+    return {
+        "enabled": LLM_CACHE_ENABLED,
+        "size": len(_VERDICT_CACHE),
+        "hits": _CACHE_HITS,
+        "misses": _CACHE_MISSES,
+    }
+
+
 def _build_prompt(candidate: CandidateSecret) -> str:
     filename = candidate.file_path.name
     unredacted_code_snippet = candidate.sanitized_context or ""
-    prompt = f"""Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
-
-### Instruction:
-You are an elite Application Security Engineer. Analyze the code snippet from '{filename}' and output a valid JSON object. 
-IMPORTANT: Output ONLY valid, raw JSON. Do NOT wrap the JSON in markdown.
-
-Evaluation Rubric:
-- SAFE: UUIDs, CSS Hex colors, public keys, empty strings, placeholder/dummy values ('test_key', 'admin123' in test context), `.example` files, `.md` files, and environment variable retrievals (e.g., os.environ.get).
-- CRITICAL: High-entropy API keys, cloud provider tokens (AWS, GCP, Azure), database URIs with complex passwords assigned to active variables.
-
-### Example 1 (Safe Placeholder):
-Filename: docs/setup.md
-Code: api_key = "YOUR_API_KEY_HERE"
-Response:
-{{
-    "reasoning": "The file is markdown documentation and the value is an obvious placeholder.",
-    "is_genuine_secret": false,
-    "confidence_score": 0.99,
-    "remediation_priority": "SAFE"
-}}
-
-### Example 2 (Safe Environment Variable):
-Filename: src/config.py
-Code: aws_key = os.getenv("AWS_ACCESS_KEY_ID")
-Response:
-{{
-    "reasoning": "The code is securely loading the credential from an environment variable, not hardcoding it.",
-    "is_genuine_secret": false,
-    "confidence_score": 0.99,
-    "remediation_priority": "SAFE"
-}}
-
-The JSON format MUST exactly match the examples above.
-Stop immediately after the final closing brace.
-
-### Input:
+    variable_name = candidate.variable_name or "UNKNOWN"
+    entropy = f"{candidate.entropy:.2f}"
+    category = candidate.secret_category
+    prompt = f"""You are an application security analyst.
+Return ONLY valid JSON with keys:
+reasoning, is_genuine_secret, confidence_score, remediation_priority.
+Allowed remediation_priority: CRITICAL,HIGH,MEDIUM,LOW,MANUAL_REVIEW_REQUIRED,SAFE.
+Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, and env-var retrieval as SAFE.
+Treat active hardcoded cloud/API credentials, private keys, JWT secrets, credentialed DB URIs, and generic high-entropy tokens in auth/key/token-like assignments as genuine secrets.
 Filename: {filename}
-Code: {unredacted_code_snippet}
-
-### Response:
+Candidate category: {category}
+Candidate variable: {variable_name}
+Candidate entropy: {entropy}
+Code:
+{unredacted_code_snippet}
+JSON:
 {{"""
     return prompt
+
+
+def _candidate_cache_key(candidate: CandidateSecret) -> str:
+    payload = "||".join(
+        [
+            candidate.secret_category,
+            candidate.raw_secret,
+            candidate.variable_name or "",
+            candidate.sanitized_context or "",
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_get(cache_key: str) -> LLMResponse | None:
+    global _CACHE_HITS, _CACHE_MISSES
+    if not LLM_CACHE_ENABLED:
+        return None
+    cached = _VERDICT_CACHE.get(cache_key)
+    if cached is None:
+        _CACHE_MISSES += 1
+        return None
+    _CACHE_HITS += 1
+    _VERDICT_CACHE.move_to_end(cache_key)
+    return cached
+
+
+def _cache_put(cache_key: str, verdict: LLMResponse) -> None:
+    if not LLM_CACHE_ENABLED:
+        return
+    _VERDICT_CACHE[cache_key] = verdict
+    _VERDICT_CACHE.move_to_end(cache_key)
+    while len(_VERDICT_CACHE) > LLM_CACHE_MAX_ENTRIES:
+        _VERDICT_CACHE.popitem(last=False)
 
 
 def _parse_json_object(payload: str) -> dict[str, Any]:
@@ -195,11 +332,22 @@ def _as_confidence(value: Any, is_secret: bool) -> float:
     return confidence
 
 
-async def evaluate_candidate(candidate: CandidateSecret) -> LLMResponse:
-    """Evaluate a candidate secret with graceful fallback behavior."""
+async def evaluate_candidate(candidate: CandidateSecret, strict: bool = False) -> LLMResponse:
+    """Evaluate a candidate secret with optional strict failure behavior."""
+    cache_key = _candidate_cache_key(candidate)
+    cached_verdict = _cache_get(cache_key)
+    if cached_verdict is not None:
+        return cached_verdict
+
     try:
-        return get_scanner().analyze_candidate(candidate)
+        verdict = get_scanner().analyze_candidate(candidate)
+        _cache_put(cache_key, verdict)
+        return verdict
     except Exception as exc:
+        if strict:
+            raise RuntimeError(
+                f"LLM validation failed for {candidate.file_path.name}:{candidate.line_number}: {exc}"
+            ) from exc
         logging.warning(
             "LLM validation failed for %s:%s. Defaulting to manual review. Error: %s",
             candidate.file_path.name,
