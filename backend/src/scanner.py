@@ -39,7 +39,7 @@ async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResp
             processed_secret = extract_fixed_window_context(secret, radius=5)
 
             # Phase 4: Ask the LLM
-            llm_evaluation = await evaluate_candidate(processed_secret)
+            llm_evaluation = await evaluate_candidate(processed_secret, scan_mode="full")
 
             all_findings.append((processed_secret, llm_evaluation))
 
@@ -56,8 +56,8 @@ async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResp
 async def scan_snippet(
     code: str,
     filename: str = "snippet.txt",
-    scan_mode: Literal["fast", "full"] = "fast",
-) -> tuple[list[tuple[CandidateSecret, LLMResponse]], Literal["fast", "full"]]:
+    scan_mode: Literal["fast", "lite", "full"] = "fast",
+) -> tuple[list[tuple[CandidateSecret, LLMResponse]], Literal["fast", "lite", "full"]]:
     """
     Scan an in-memory code snippet by writing it to a temporary file and
     reusing the existing regex + LLM pipeline stages.
@@ -69,38 +69,42 @@ async def scan_snippet(
 
         file_path = Path(tmp.name)
         findings: list[tuple[CandidateSecret, LLMResponse]] = []
-        candidate_profile: Literal["fast", "full"] = "full" if scan_mode == "full" else "fast"
+        candidate_profile: Literal["fast", "full"] = "full" if scan_mode in {"lite", "full"} else "fast"
         secrets = await scan_file_for_secrets(file_path, profile=candidate_profile)
-        effective_mode: Literal["fast", "full"] = scan_mode
+        effective_mode: Literal["fast", "lite", "full"] = scan_mode
 
-        if scan_mode == "full":
+        if scan_mode in {"lite", "full"}:
             llm_ready, llm_reason = get_llm_runtime_status()
             if not llm_ready:
                 raise FullScanError(
-                    "Full scan failed before inference started.",
+                    f"{scan_mode.title()} scan failed before inference started.",
                     logs=[
-                        "Requested mode: full",
+                        f"Requested mode: {scan_mode}",
                         f"Runtime check failed: {llm_reason}",
                         "Action: install and configure MLX runtime (`mlx_lm`) or run fast scan.",
                     ],
                 )
 
-        for secret in secrets:
-            processed_secret = extract_fixed_window_context(secret, radius=5)
-            if effective_mode == "full":
+        processed_secrets = [extract_fixed_window_context(secret, radius=5) for secret in secrets]
+
+        if effective_mode in {"lite", "full"}:
+            for secret in processed_secrets:
                 try:
-                    verdict = await evaluate_candidate(processed_secret, strict=True)
+                    verdict = await evaluate_candidate(
+                        secret,
+                        strict=True,
+                        scan_mode=effective_mode,
+                    )
                 except Exception as exc:
-                    raise FullScanError(
-                        "Full scan failed during model inference.",
-                        logs=[
-                            "Requested mode: full",
-                            f"Failure at {processed_secret.file_path.name}:{processed_secret.line_number}",
-                            str(exc),
-                        ],
-                    ) from exc
-            else:
-                verdict = heuristic_verdict(processed_secret)
-            findings.append((processed_secret, verdict))
+                    verdict = LLMResponse(
+                        is_genuine_secret=True,
+                        confidence_score=0.0,
+                        remediation_priority="MANUAL_REVIEW_REQUIRED",
+                        reasoning=f"Inference failed: {exc}",
+                    )
+                findings.append((secret, verdict))
+        else:
+            for secret in processed_secrets:
+                findings.append((secret, heuristic_verdict(secret)))
 
         return findings, effective_mode

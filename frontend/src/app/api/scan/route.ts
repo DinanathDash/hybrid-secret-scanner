@@ -6,6 +6,11 @@ const BACKEND_TIMEOUT_MS_FAST = Number(
     process.env.BACKEND_SCAN_TIMEOUT_MS ??
     "120000",
 );
+const BACKEND_TIMEOUT_MS_LITE = Number(
+  process.env.BACKEND_SCAN_TIMEOUT_MS_LITE ??
+    process.env.BACKEND_SCAN_TIMEOUT_MS ??
+    "300000",
+);
 const BACKEND_TIMEOUT_MS_FULL = Number(
   process.env.BACKEND_SCAN_TIMEOUT_MS_FULL ??
     process.env.BACKEND_SCAN_TIMEOUT_MS ??
@@ -13,6 +18,7 @@ const BACKEND_TIMEOUT_MS_FULL = Number(
 );
 
 export async function POST(request: Request) {
+  let effectiveTimeoutMs = BACKEND_TIMEOUT_MS_FAST;
   let payload: unknown;
   try {
     payload = await request.json();
@@ -29,11 +35,17 @@ export async function POST(request: Request) {
       payload !== null &&
       "scan_mode" in payload &&
       typeof (payload as { scan_mode?: unknown }).scan_mode === "string"
-        ? ((payload as { scan_mode: string }).scan_mode.toLowerCase() as "fast" | "full")
+        ? (payload as { scan_mode: string }).scan_mode.toLowerCase()
         : "fast";
+    const normalizedMode: "fast" | "lite" | "full" =
+      scanMode === "lite" || scanMode === "full" ? scanMode : "fast";
 
-    const effectiveTimeoutMs =
-      scanMode === "full" ? BACKEND_TIMEOUT_MS_FULL : BACKEND_TIMEOUT_MS_FAST;
+    effectiveTimeoutMs =
+      normalizedMode === "full"
+        ? BACKEND_TIMEOUT_MS_FULL
+        : normalizedMode === "lite"
+          ? BACKEND_TIMEOUT_MS_LITE
+          : BACKEND_TIMEOUT_MS_FAST;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), effectiveTimeoutMs);

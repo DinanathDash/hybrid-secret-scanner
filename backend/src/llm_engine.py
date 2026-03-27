@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import warnings
 from collections import OrderedDict
@@ -35,6 +36,7 @@ _WARMUP_MESSAGE = "Not warmed yet."
 _VERDICT_CACHE: OrderedDict[str, LLMResponse] = OrderedDict()
 _CACHE_HITS = 0
 _CACHE_MISSES = 0
+_INFERENCE_LOCK = threading.Lock()
 
 
 class HybridAIScanner:
@@ -62,7 +64,11 @@ class HybridAIScanner:
             adapter_path=LLM_ADAPTER_PATH,
         )
 
-    def analyze_candidate(self, candidate: CandidateSecret) -> LLMResponse:
+    def analyze_candidate(
+        self,
+        candidate: CandidateSecret,
+        scan_mode: str = "full",
+    ) -> LLMResponse:
         """Run deterministic MLX inference and parse structured verdict safely."""
         if self.dry_run:
             return LLMResponse(
@@ -74,14 +80,16 @@ class HybridAIScanner:
 
         from mlx_lm import generate
 
-        prompt = _build_prompt(candidate)
+        prompt = _build_prompt(candidate, scan_mode=scan_mode)
 
-        raw_response = generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
-            max_tokens=min(LLM_MAX_TOKENS, _EFFECTIVE_MAX_TOKENS),
-        )
+        dynamic_max = 40 if scan_mode == "lite" else 150
+        with _INFERENCE_LOCK:
+            raw_response = generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=dynamic_max,
+            )
         parsed = _parse_json_object(raw_response)
 
         priority = str(parsed.get("remediation_priority", "SAFE")).upper()
@@ -97,7 +105,10 @@ class HybridAIScanner:
 
         is_secret = priority in CONFIRMED_SECRET_PRIORITIES
         confidence = _as_confidence(parsed.get("confidence_score"), is_secret)
-        reasoning = str(parsed.get("reasoning", "No reasoning provided by model."))
+        if scan_mode == "lite":
+            reasoning = "Lite mode: LLM evaluated context without explanation."
+        else:
+            reasoning = str(parsed.get("reasoning", "No reasoning provided by model."))
 
         return LLMResponse(
             is_genuine_secret=is_secret,
@@ -105,6 +116,88 @@ class HybridAIScanner:
             remediation_priority=priority,
             reasoning=reasoning,
         )
+
+    def analyze_candidates_batch(
+        self,
+        candidates: list[CandidateSecret],
+        scan_mode: str,
+    ) -> dict[int, LLMResponse]:
+        """Run a single LLM call for many candidates and map by line number."""
+        if not candidates:
+            return {}
+
+        if self.dry_run:
+            return {
+                candidate.line_number: LLMResponse(
+                    is_genuine_secret=False,
+                    confidence_score=0.0,
+                    remediation_priority="SAFE",
+                    reasoning="Dry-run mode enabled. LLM inference skipped.",
+                )
+                for candidate in candidates
+            }
+
+        from mlx_lm import generate
+
+        prompt = _build_batch_prompt(candidates, scan_mode=scan_mode)
+        dynamic_max = min(100 * len(candidates), 900)
+        with _INFERENCE_LOCK:
+            raw_response = generate(
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
+                max_tokens=dynamic_max,
+            )
+        parsed_array = _parse_json_object(raw_response, expect_array=True)
+
+        by_line: dict[int, LLMResponse] = {}
+        for item in parsed_array:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                line_number = int(item.get("line_number"))
+            except (TypeError, ValueError):
+                continue
+
+            priority = str(item.get("remediation_priority", "SAFE")).upper()
+            if priority not in {
+                "CRITICAL",
+                "HIGH",
+                "MEDIUM",
+                "LOW",
+                "MANUAL_REVIEW_REQUIRED",
+                "SAFE",
+            }:
+                priority = "SAFE"
+
+            is_secret = priority in CONFIRMED_SECRET_PRIORITIES
+            confidence = _as_confidence(item.get("confidence_score"), is_secret)
+            if scan_mode == "lite":
+                reasoning = "Lite mode: LLM evaluated context without explanation."
+            else:
+                reasoning = str(item.get("reasoning", "No reasoning provided by model."))
+
+            by_line[line_number] = LLMResponse(
+                is_genuine_secret=is_secret,
+                confidence_score=confidence,
+                remediation_priority=priority,
+                reasoning=reasoning,
+            )
+
+        for candidate in candidates:
+            if candidate.line_number not in by_line:
+                by_line[candidate.line_number] = LLMResponse(
+                    is_genuine_secret=True,
+                    confidence_score=0.0,
+                    remediation_priority="MANUAL_REVIEW_REQUIRED",
+                    reasoning=(
+                        "Batch LLM output missing this line number. "
+                        "Defaulting to manual review."
+                    ),
+                )
+
+        return by_line
 
 
 def get_scanner() -> HybridAIScanner:
@@ -220,27 +313,116 @@ def get_cache_stats() -> dict[str, int | bool]:
     }
 
 
-def _build_prompt(candidate: CandidateSecret) -> str:
+def _build_prompt(candidate: CandidateSecret, scan_mode: str = "full") -> str:
     filename = candidate.file_path.name
     unredacted_code_snippet = candidate.sanitized_context or ""
     variable_name = candidate.variable_name or "UNKNOWN"
+    line_number = candidate.line_number
     entropy = f"{candidate.entropy:.2f}"
     category = candidate.secret_category
+    output_contract = (
+        "is_genuine_secret, confidence_score, remediation_priority"
+        if scan_mode == "lite"
+        else "reasoning, is_genuine_secret, confidence_score, remediation_priority"
+    )
+    extra_lite = (
+        "LITE MODE: Do NOT include a reasoning field.\n"
+        "Return ONLY: {\"is_genuine_secret\": bool, \"confidence_score\": float, "
+        "\"remediation_priority\": \"...\"}\n"
+    )
+    if scan_mode == "lite":
+        extra_lite = (
+            "LITE MODE: Do NOT include a reasoning field.\n"
+            "Return ONLY: {\"is_genuine_secret\": bool, \"confidence_score\": float, "
+            "\"remediation_priority\": \"...\"}\n"
+        )
+    else:
+        extra_lite = ""
+
     prompt = f"""You are an application security analyst.
 Return ONLY valid JSON with keys:
-reasoning, is_genuine_secret, confidence_score, remediation_priority.
+{output_contract}.
+IMPORTANT: You MUST wrap all JSON keys in double quotes.
 Allowed remediation_priority: CRITICAL,HIGH,MEDIUM,LOW,MANUAL_REVIEW_REQUIRED,SAFE.
-Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, and env-var retrieval as SAFE.
+Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, env-var retrieval, and any string containing 'EXAMPLE', 'DUMMY', or 'test' as SAFE.
 Treat active hardcoded cloud/API credentials, private keys, JWT secrets, credentialed DB URIs, and generic high-entropy tokens in auth/key/token-like assignments as genuine secrets.
+Focus on the target secret and its line first; use surrounding context only for disambiguation.
+{extra_lite}
+
+### Input:
 Filename: {filename}
+Line Number: {line_number}
 Candidate category: {category}
 Candidate variable: {variable_name}
 Candidate entropy: {entropy}
-Code:
+Target Secret to Evaluate: {candidate.raw_secret}
+Context Window:
 {unredacted_code_snippet}
-JSON:
+
+### Output:
 {{"""
     return prompt
+
+
+def _build_batch_prompt(candidates: list[CandidateSecret], scan_mode: str = "full") -> str:
+    first = candidates[0]
+    filename = first.file_path.name
+    include_reasoning = scan_mode != "lite"
+    candidate_lines: list[str] = []
+
+    for candidate in candidates:
+        context = candidate.sanitized_context or ""
+        variable_name = candidate.variable_name or "UNKNOWN"
+        entropy = f"{candidate.entropy:.2f}"
+        candidate_lines.append(
+            "\n".join(
+                [
+                    f"Line {candidate.line_number}: {candidate.raw_secret}",
+                    f"  category: {candidate.secret_category}",
+                    f"  variable: {variable_name}",
+                    f"  entropy: {entropy}",
+                    "  context:",
+                    context,
+                ]
+            )
+        )
+
+    candidate_list_string = "\n\n".join(candidate_lines)
+    reasoning_instruction = (
+        'Include a "reasoning" field with concise security rationale for each item.'
+        if include_reasoning
+        else 'LITE MODE: Omit the "reasoning" field entirely.'
+    )
+    reasoning_example = '    "reasoning": "...",\n' if include_reasoning else ""
+
+    return f"""You are an application security analyst.
+Return ONLY valid JSON.
+Output must be a JSON array where each object maps to one candidate using line_number.
+IMPORTANT: You MUST wrap all JSON keys in double quotes.
+Allowed remediation_priority: CRITICAL,HIGH,MEDIUM,LOW,MANUAL_REVIEW_REQUIRED,SAFE.
+Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, env-var retrieval, and any string containing 'EXAMPLE', 'DUMMY', or 'test' as SAFE.
+Treat active hardcoded cloud/API credentials, private keys, JWT secrets, credentialed DB URIs, and generic high-entropy tokens in auth/key/token-like assignments as genuine secrets.
+Focus on each target secret and its line first; use surrounding context only for disambiguation.
+{reasoning_instruction}
+
+### Input:
+Filename: {filename}
+Candidates to Evaluate:
+{candidate_list_string}
+
+### Output Format:
+[
+  {{
+    "line_number": int,
+{reasoning_example}    "is_genuine_secret": bool,
+    "confidence_score": float,
+    "remediation_priority": "..."
+  }}
+]
+
+### Output:
+[
+"""
 
 
 def _candidate_cache_key(candidate: CandidateSecret) -> str:
@@ -277,10 +459,13 @@ def _cache_put(cache_key: str, verdict: LLMResponse) -> None:
         _VERDICT_CACHE.popitem(last=False)
 
 
-def _parse_json_object(payload: str) -> dict[str, Any]:
-    """Parse model output robustly, extracting only the first JSON object."""
-    # Rebuild the opening brace that is prefilled in the prompt.
-    full_payload = payload if payload.lstrip().startswith("{") else "{" + payload
+def _parse_json_object(payload: str, expect_array: bool = False) -> dict[str, Any] | list[Any]:
+    """Parse model output robustly, extracting JSON object or array content."""
+    if expect_array:
+        full_payload = payload if payload.lstrip().startswith("[") else "[" + payload
+    else:
+        # Rebuild the opening brace that is prefilled in the prompt.
+        full_payload = payload if payload.lstrip().startswith("{") else "{" + payload
 
     clean_text = full_payload.split("<|eot_id|>")[0].strip()
 
@@ -302,11 +487,28 @@ def _parse_json_object(payload: str) -> dict[str, Any]:
     clean_text = re.sub(r"^```\s*", "", clean_text)
     clean_text = re.sub(r"\s*```$", "", clean_text)
 
-    start_idx = clean_text.find("{")
-    if start_idx != -1:
-        clean_text = clean_text[start_idx:]
+    if expect_array:
+        start_idx = clean_text.find("[")
+        end_idx = clean_text.rfind("]")
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            logging.warning("Failed to locate JSON array boundaries in LLM output.")
+            logging.warning("Cleaned LLM output for debugging: %s", clean_text)
+            return []
+        clean_text = clean_text[start_idx : end_idx + 1]
+    else:
+        start_idx = clean_text.find("{")
+        if start_idx != -1:
+            clean_text = clean_text[start_idx:]
+    clean_text = re.sub(r'([{,]\s*)([a-zA-Z0-9_]+)(\s*:)', r'\1"\2"\3', clean_text)
 
     try:
+        if expect_array:
+            parsed = json.loads(clean_text)
+            if isinstance(parsed, list):
+                return parsed
+            logging.warning("LLM returned non-array JSON payload after cleaning: %s", clean_text)
+            return []
+
         # Parse only the first complete JSON object and ignore any trailing junk.
         parsed, end_idx = json.JSONDecoder().raw_decode(clean_text)
         clean_text = clean_text[:end_idx]
@@ -317,7 +519,7 @@ def _parse_json_object(payload: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         logging.warning("Failed to parse LLM JSON output after cleaning. Error: %s", exc)
         logging.warning("Cleaned LLM output for debugging: %s", clean_text)
-        return {}
+        return [] if expect_array else {}
 
 
 def _as_confidence(value: Any, is_secret: bool) -> float:
@@ -332,15 +534,19 @@ def _as_confidence(value: Any, is_secret: bool) -> float:
     return confidence
 
 
-async def evaluate_candidate(candidate: CandidateSecret, strict: bool = False) -> LLMResponse:
+async def evaluate_candidate(
+    candidate: CandidateSecret,
+    strict: bool = False,
+    scan_mode: str = "full",
+) -> LLMResponse:
     """Evaluate a candidate secret with optional strict failure behavior."""
-    cache_key = _candidate_cache_key(candidate)
+    cache_key = f"{scan_mode}::{_candidate_cache_key(candidate)}"
     cached_verdict = _cache_get(cache_key)
     if cached_verdict is not None:
         return cached_verdict
 
     try:
-        verdict = get_scanner().analyze_candidate(candidate)
+        verdict = get_scanner().analyze_candidate(candidate, scan_mode=scan_mode)
         _cache_put(cache_key, verdict)
         return verdict
     except Exception as exc:
@@ -360,3 +566,61 @@ async def evaluate_candidate(candidate: CandidateSecret, strict: bool = False) -
             remediation_priority="MANUAL_REVIEW_REQUIRED",
             reasoning="LLM inference failed or timed out. Defaulting to manual review.",
         )
+
+
+async def evaluate_candidates_batch(
+    candidates: list[CandidateSecret],
+    strict: bool = False,
+    scan_mode: str = "full",
+) -> dict[int, LLMResponse]:
+    """Evaluate many candidates in one inference call, with cache-aware fallbacks."""
+    if not candidates:
+        return {}
+
+    line_to_verdict: dict[int, LLMResponse] = {}
+    uncached: list[CandidateSecret] = []
+    uncached_keys: dict[int, str] = {}
+
+    for candidate in candidates:
+        cache_key = f"{scan_mode}::{_candidate_cache_key(candidate)}"
+        cached_verdict = _cache_get(cache_key)
+        if cached_verdict is not None:
+            line_to_verdict[candidate.line_number] = cached_verdict
+            continue
+        uncached.append(candidate)
+        uncached_keys[candidate.line_number] = cache_key
+
+    if uncached:
+        try:
+            uncached_results = get_scanner().analyze_candidates_batch(uncached, scan_mode=scan_mode)
+        except Exception as exc:
+            if strict:
+                first = uncached[0]
+                raise RuntimeError(
+                    "LLM batch validation failed for "
+                    f"{first.file_path.name}:{first.line_number}: {exc}"
+                ) from exc
+            logging.warning("LLM batch validation failed. Defaulting to manual review. Error: %s", exc)
+            uncached_results = {
+                candidate.line_number: LLMResponse(
+                    is_genuine_secret=True,
+                    confidence_score=0.0,
+                    remediation_priority="MANUAL_REVIEW_REQUIRED",
+                    reasoning="LLM batch inference failed or timed out. Defaulting to manual review.",
+                )
+                for candidate in uncached
+            }
+
+        for candidate in uncached:
+            verdict = uncached_results.get(candidate.line_number)
+            if verdict is None:
+                verdict = LLMResponse(
+                    is_genuine_secret=True,
+                    confidence_score=0.0,
+                    remediation_priority="MANUAL_REVIEW_REQUIRED",
+                    reasoning="Batch LLM output missing this line number. Defaulting to manual review.",
+                )
+            line_to_verdict[candidate.line_number] = verdict
+            _cache_put(uncached_keys[candidate.line_number], verdict)
+
+    return line_to_verdict

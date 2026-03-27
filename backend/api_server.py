@@ -84,8 +84,8 @@ class ScannerRequestHandler(BaseHTTPRequestHandler):
             ):
                 raise ValueError("`code`, `filename`, and `scan_mode` must be strings.")
             scan_mode = scan_mode.lower().strip()
-            if scan_mode not in {"fast", "full"}:
-                raise ValueError("`scan_mode` must be either 'fast' or 'full'.")
+            if scan_mode not in {"fast", "lite", "full"}:
+                raise ValueError("`scan_mode` must be one of 'fast', 'lite', or 'full'.")
         except Exception as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -109,9 +109,9 @@ class ScannerRequestHandler(BaseHTTPRequestHandler):
                         "is_genuine_secret": verdict.is_genuine_secret,
                         "confidence_score": verdict.confidence_score,
                         "confidence_method": (
-                            "llm_reported_score"
-                            if effective_mode == "full"
-                            else "heuristic_entropy_band"
+                            "heuristic_entropy_band"
+                            if effective_mode == "fast"
+                            else ("llm_lite_score" if effective_mode == "lite" else "llm_reported_score")
                         ),
                         "remediation_priority": verdict.remediation_priority,
                         "reasoning": verdict.reasoning,
@@ -168,7 +168,7 @@ class ScannerRequestHandler(BaseHTTPRequestHandler):
                 {
                     "error": str(exc),
                     "scan_mode_requested": scan_mode,
-                    "scan_mode_effective": "full",
+                    "scan_mode_effective": scan_mode,
                     "llm_runtime": {
                         "ready": llm_runtime_ready,
                         "reason": llm_runtime_reason,

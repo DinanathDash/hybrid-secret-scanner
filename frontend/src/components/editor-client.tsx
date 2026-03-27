@@ -5,7 +5,7 @@ import flourite from "flourite";
 import Editor from "@monaco-editor/react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
-import { Loader2, ShieldCheck, ShieldAlert, Code2 } from "lucide-react";
+import { Loader2, ShieldCheck, ShieldAlert, Code2, ChevronDown } from "lucide-react";
 import { ModeToggle } from "./mode-toggle";
 import {
   Tooltip,
@@ -18,6 +18,13 @@ import {
   ResizablePanelGroup,
 } from "@/components/ui/resizable";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 const EDITOR_SKELETON_WIDTHS = [72, 88, 65, 91, 78, 55, 84, 70, 95, 63, 80, 68];
 const MONACO_SKELETON_WIDTHS = [75, 90, 60, 85, 70, 95, 65, 80, 55, 88, 72, 93, 67, 78];
 
@@ -32,8 +39,8 @@ type ScanFinding = {
 };
 
 type ScanApiResponse = {
-  scan_mode_requested?: "fast" | "full";
-  scan_mode_effective?: "fast" | "full";
+  scan_mode_requested?: "fast" | "lite" | "full";
+  scan_mode_effective?: "fast" | "lite" | "full";
   duration_ms?: number;
   duration_seconds?: number;
   llm_runtime?: {
@@ -72,7 +79,8 @@ export function App() {
   const [scanResult, setScanResult] = useState<ScanApiResponse | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [scanLogs, setScanLogs] = useState<string[]>([]);
-  const [scanMode, setScanMode] = useState<"fast" | "full">("fast");
+  const [scanMode, setScanMode] = useState<"fast" | "lite" | "full">("fast");
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [direction, setDirection] = useState<"horizontal" | "vertical">(
     "horizontal",
   );
@@ -212,22 +220,30 @@ export function App() {
             </TooltipContent>
           </Tooltip>
 
-          <Button
-            variant={scanMode === "fast" ? "default" : "outline"}
-            size="sm"
-            disabled={isScanning}
-            onClick={() => setScanMode("fast")}
-          >
-            Fast Scan
-          </Button>
-          <Button
-            variant={scanMode === "full" ? "default" : "outline"}
-            size="sm"
-            disabled={isScanning}
-            onClick={() => setScanMode("full")}
-          >
-            Full Scan
-          </Button>
+          <DropdownMenu open={modeMenuOpen} onOpenChange={setModeMenuOpen}>
+            <DropdownMenuTrigger
+              disabled={isScanning}
+              render={
+                <Button variant="outline" size="sm">
+                  {scanMode === "fast" ? "Fast" : scanMode === "lite" ? "Lite" : "Full"} Scan
+                  <ChevronDown className="ml-2 h-4 w-4" />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end">
+              <DropdownMenuRadioGroup
+                value={scanMode}
+                onValueChange={(value) => {
+                  setScanMode(value as "fast" | "lite" | "full");
+                  setModeMenuOpen(false);
+                }}
+              >
+                <DropdownMenuRadioItem value="fast">Fast Scan</DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="lite">Lite Scan</DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="full">Full Scan</DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button
             onClick={handleScan}
             disabled={isScanning}
@@ -341,7 +357,9 @@ export function App() {
                       Effective Mode: {(scanResult.scan_mode_effective ?? scanMode).toUpperCase()}
                       {(scanResult.scan_mode_effective ?? scanMode) === "fast"
                         ? " (regex + heuristics)"
-                        : " (regex + model inference)"}
+                        : (scanResult.scan_mode_effective ?? scanMode) === "lite"
+                          ? " (regex + lightweight LLM inference)"
+                          : " (regex + full model inference)"}
                     </span>
                     <span className="text-xs opacity-80">
                       Duration: {scanResult.duration_seconds ?? ((scanResult.duration_ms ?? 0) / 1000)} s

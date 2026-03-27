@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Literal
 
@@ -24,7 +26,7 @@ REGEX_PATTERNS = {
         r"(?i)(-----BEGIN [A-Z ]+ PRIVATE KEY-----|eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,})"
     ),
     "GENERIC_HIGH_ENTROPY_TOKEN": re.compile(
-        r"(?i)[a-z0-9_]*(?:key|token|secret|password|auth|jwt|hash|signature)[a-z0-9_]*[\s]*[=:]\s*['\"]([A-Za-z0-9+/=_-]{16,})['\"]"
+        r"(?i)[a-z0-9_]*(?:key|token|secret|password|auth|jwt|hash|signature)[a-z0-9_]*[\s]*[=:]\s*['\"]([A-Za-z0-9+/=_\-\.]{16,})['\"]"
     ),
 }
 # Backward-compatible alias.
@@ -46,10 +48,12 @@ HIGH_RISK_CATEGORIES = {
 def calculate_shannon_entropy(data: str) -> float:
     if not data:
         return 0.0
+    frequencies = Counter(data)
+    length = len(data)
     entropy = 0.0
-    for token in set(data):
-        probability = float(data.count(token)) / len(data)
-        entropy -= probability * math.log(probability, 2)
+    for count in frequencies.values():
+        probability = count / length
+        entropy -= probability * math.log2(probability)
     return entropy
 
 
@@ -59,9 +63,6 @@ def _is_obvious_non_secret(value: str) -> bool:
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
         value,
     ):
-        return True
-    # SHA-256 / SHA-1 style hashes
-    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value):
         return True
     return False
 
@@ -80,7 +81,7 @@ async def scan_file_for_secrets(
     """Fast, signature-based candidate extraction."""
     findings: list[CandidateSecret] = []
     try:
-        with open(file_path, encoding="utf-8", errors="ignore") as handle:
+        with open(file_path, encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
                 seen_values: set[str] = set()
                 for category, pattern in REGEX_PATTERNS.items():
@@ -97,7 +98,7 @@ async def scan_file_for_secrets(
                         ):
                             continue
                         entropy = calculate_shannon_entropy(secret_value)
-                        if category == "GENERIC_HIGH_ENTROPY_TOKEN" and entropy <= 3.0:
+                        if category == "GENERIC_HIGH_ENTROPY_TOKEN" and entropy <= 2.5:
                             continue
                         seen_values.add(secret_value)
                         findings.append(
@@ -109,9 +110,8 @@ async def scan_file_for_secrets(
                                 entropy=entropy,
                             )
                         )
-    except Exception:
-        # Ignore unreadable files while preserving scan continuity.
-        pass
+    except (UnicodeDecodeError, PermissionError, FileNotFoundError) as exc:
+        logging.warning("Skipping file %s: %s", file_path, exc)
 
     return findings
 
