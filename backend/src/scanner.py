@@ -1,5 +1,7 @@
+from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from time import perf_counter
 from typing import Literal
 
 from src.ingestion import yield_scannable_files
@@ -7,7 +9,12 @@ from src.models import CandidateSecret, LLMResponse
 
 from .context_extractor import extract_fixed_window_context
 from .fast_scanner import heuristic_verdict, scan_file_for_secrets
-from .llm_engine import evaluate_candidate, get_llm_runtime_status
+from .llm_engine import evaluate_candidate, get_llm_runtime_status, get_scanner
+
+
+def local_now_iso() -> str:
+    """Return current system-local time with timezone offset."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class FullScanError(Exception):
@@ -16,7 +23,7 @@ class FullScanError(Exception):
         self.logs = logs or []
 
 
-async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResponse]]:
+async def run_pipeline(target_path: Path, max_hits: int | None = None) -> list[tuple[CandidateSecret, LLMResponse]]:
     """
     The main orchestrator.
     Phase 1 (Ingest) -> Phase 2 (Scan) -> Phase 3 (Context) -> Phase 4 (LLM Validate).
@@ -31,24 +38,39 @@ async def run_pipeline(target_path: Path) -> list[tuple[CandidateSecret, LLMResp
     else:
         return all_findings
 
-    for file_path in file_paths:
-        secrets = await scan_file_for_secrets(file_path, profile="full")
+    # Preload MLX model/tokenizer once before entering candidate evaluation loops.
+    scanner = get_scanner()
 
-        for secret in secrets:
-            # Build a strict 11-line window (target line +/- 5) for LLM context.
-            processed_secret = extract_fixed_window_context(secret, radius=5)
+    try:
+        for file_path in file_paths:
+            secrets = await scan_file_for_secrets(file_path, profile="full")
 
-            # Phase 4: Ask the LLM
-            llm_evaluation = await evaluate_candidate(processed_secret, scan_mode="full")
+            for secret in secrets:
+                if max_hits is not None and len(all_findings) >= max_hits:
+                    print(f"\n[!] Reached max_hits limit of {max_hits} inside scanner pipeline. Halting.")
+                    return all_findings
 
-            all_findings.append((processed_secret, llm_evaluation))
+                # Build a strict 11-line window (target line +/- 5) for LLM context.
+                processed_secret = extract_fixed_window_context(secret, radius=5)
 
-            print(
-                f"[!] {processed_secret.secret_category} in {processed_secret.file_path.name}:{processed_secret.line_number}"
-            )
-            print(
-                f"    -> LLM Verdict: Genuine={llm_evaluation.is_genuine_secret} | Confidence={llm_evaluation.confidence_score} | Priority={llm_evaluation.remediation_priority}"
-            )
+                # Phase 4: Ask the LLM
+                case_started_at = local_now_iso()
+                case_t0 = perf_counter()
+                llm_evaluation = scanner.analyze_candidate(processed_secret, scan_mode="lite")
+                case_elapsed_seconds = perf_counter() - case_t0
+                case_finished_at = local_now_iso()
+
+                all_findings.append((processed_secret, llm_evaluation))
+
+                print(
+                    f"[{case_finished_at}] [!] {processed_secret.secret_category} in {processed_secret.file_path.name}:{processed_secret.line_number}"
+                )
+                print(
+                    f"    -> LLM Verdict: Genuine={llm_evaluation.is_genuine_secret} | Confidence={llm_evaluation.confidence_score} | Priority={llm_evaluation.remediation_priority} | LLM Time={case_elapsed_seconds:.3f}s | Started={case_started_at}"
+                )
+    except KeyboardInterrupt:
+        print("\n[!] Ctrl+C received in pipeline. Returning partial findings collected so far.")
+        return all_findings
 
     return all_findings
 

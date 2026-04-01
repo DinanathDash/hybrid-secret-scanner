@@ -82,7 +82,7 @@ class HybridAIScanner:
 
         prompt = _build_prompt(candidate, scan_mode=scan_mode)
 
-        dynamic_max = 40 if scan_mode == "lite" else 150
+        dynamic_max = 40
         with _INFERENCE_LOCK:
             raw_response = generate(
                 self.model,
@@ -105,10 +105,7 @@ class HybridAIScanner:
 
         is_secret = priority in CONFIRMED_SECRET_PRIORITIES
         confidence = _as_confidence(parsed.get("confidence_score"), is_secret)
-        if scan_mode == "lite":
-            reasoning = "Lite mode: LLM evaluated context without explanation."
-        else:
-            reasoning = str(parsed.get("reasoning", "No reasoning provided by model."))
+        reasoning = "Reasoning disabled for throughput benchmarking."
 
         return LLMResponse(
             is_genuine_secret=is_secret,
@@ -140,7 +137,7 @@ class HybridAIScanner:
         from mlx_lm import generate
 
         prompt = _build_batch_prompt(candidates, scan_mode=scan_mode)
-        dynamic_max = min(100 * len(candidates), 900)
+        dynamic_max = min(40 * len(candidates), 400)
         with _INFERENCE_LOCK:
             raw_response = generate(
                 self.model,
@@ -173,10 +170,7 @@ class HybridAIScanner:
 
             is_secret = priority in CONFIRMED_SECRET_PRIORITIES
             confidence = _as_confidence(item.get("confidence_score"), is_secret)
-            if scan_mode == "lite":
-                reasoning = "Lite mode: LLM evaluated context without explanation."
-            else:
-                reasoning = str(item.get("reasoning", "No reasoning provided by model."))
+            reasoning = "Reasoning disabled for throughput benchmarking."
 
             by_line[line_number] = LLMResponse(
                 is_genuine_secret=is_secret,
@@ -320,34 +314,18 @@ def _build_prompt(candidate: CandidateSecret, scan_mode: str = "full") -> str:
     line_number = candidate.line_number
     entropy = f"{candidate.entropy:.2f}"
     category = candidate.secret_category
-    output_contract = (
-        "is_genuine_secret, confidence_score, remediation_priority"
-        if scan_mode == "lite"
-        else "reasoning, is_genuine_secret, confidence_score, remediation_priority"
-    )
-    extra_lite = (
-        "LITE MODE: Do NOT include a reasoning field.\n"
-        "Return ONLY: {\"is_genuine_secret\": bool, \"confidence_score\": float, "
-        "\"remediation_priority\": \"...\"}\n"
-    )
-    if scan_mode == "lite":
-        extra_lite = (
-            "LITE MODE: Do NOT include a reasoning field.\n"
-            "Return ONLY: {\"is_genuine_secret\": bool, \"confidence_score\": float, "
-            "\"remediation_priority\": \"...\"}\n"
-        )
-    else:
-        extra_lite = ""
+    output_contract = "is_genuine_secret, confidence_score, remediation_priority"
 
     prompt = f"""You are an application security analyst.
 Return ONLY valid JSON with keys:
 {output_contract}.
 IMPORTANT: You MUST wrap all JSON keys in double quotes.
+You must respond with valid, parseable JSON only. Do not include markdown formatting, code blocks, or conversational text. All string values, including keys and the `remediation_priority` value, MUST be enclosed in double quotes (e.g., "CRITICAL", "HIGH", "SAFE"). Example: {{"is_genuine_secret": true, "confidence_score": 0.99, "remediation_priority": "CRITICAL"}}
+You are a highly skeptical security analyst. Your default assumption is that the provided string is a dummy value, placeholder, or test token. You must ONLY classify `is_genuine_secret: true` if there is overwhelming contextual evidence that this is a live, production-grade credential. Aggressively flag examples, documentation snippets, obvious entropy variables (e.g., 'test_password', '12345'), and code templates as `is_genuine_secret: false`.
 Allowed remediation_priority: CRITICAL,HIGH,MEDIUM,LOW,MANUAL_REVIEW_REQUIRED,SAFE.
 Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, env-var retrieval, and any string containing 'EXAMPLE', 'DUMMY', or 'test' as SAFE.
 Treat active hardcoded cloud/API credentials, private keys, JWT secrets, credentialed DB URIs, and generic high-entropy tokens in auth/key/token-like assignments as genuine secrets.
 Focus on the target secret and its line first; use surrounding context only for disambiguation.
-{extra_lite}
 
 ### Input:
 Filename: {filename}
@@ -367,7 +345,6 @@ Context Window:
 def _build_batch_prompt(candidates: list[CandidateSecret], scan_mode: str = "full") -> str:
     first = candidates[0]
     filename = first.file_path.name
-    include_reasoning = scan_mode != "lite"
     candidate_lines: list[str] = []
 
     for candidate in candidates:
@@ -388,22 +365,16 @@ def _build_batch_prompt(candidates: list[CandidateSecret], scan_mode: str = "ful
         )
 
     candidate_list_string = "\n\n".join(candidate_lines)
-    reasoning_instruction = (
-        'Include a "reasoning" field with concise security rationale for each item.'
-        if include_reasoning
-        else 'LITE MODE: Omit the "reasoning" field entirely.'
-    )
-    reasoning_example = '    "reasoning": "...",\n' if include_reasoning else ""
-
     return f"""You are an application security analyst.
 Return ONLY valid JSON.
 Output must be a JSON array where each object maps to one candidate using line_number.
 IMPORTANT: You MUST wrap all JSON keys in double quotes.
+You must respond with valid, parseable JSON only. Do not include markdown formatting, code blocks, or conversational text. All string values, including keys and the `remediation_priority` value, MUST be enclosed in double quotes (e.g., "CRITICAL", "HIGH", "SAFE"). Example: {{"is_genuine_secret": true, "confidence_score": 0.99, "remediation_priority": "CRITICAL"}}
+You are a highly skeptical security analyst. Your default assumption is that the provided string is a dummy value, placeholder, or test token. You must ONLY classify `is_genuine_secret: true` if there is overwhelming contextual evidence that this is a live, production-grade credential. Aggressively flag examples, documentation snippets, obvious entropy variables (e.g., 'test_password', '12345'), and code templates as `is_genuine_secret: false`.
 Allowed remediation_priority: CRITICAL,HIGH,MEDIUM,LOW,MANUAL_REVIEW_REQUIRED,SAFE.
 Treat placeholders, hashes, UUIDs, PUBLIC KEY blocks, docs/examples, env-var retrieval, and any string containing 'EXAMPLE', 'DUMMY', or 'test' as SAFE.
 Treat active hardcoded cloud/API credentials, private keys, JWT secrets, credentialed DB URIs, and generic high-entropy tokens in auth/key/token-like assignments as genuine secrets.
 Focus on each target secret and its line first; use surrounding context only for disambiguation.
-{reasoning_instruction}
 
 ### Input:
 Filename: {filename}
@@ -414,7 +385,7 @@ Candidates to Evaluate:
 [
   {{
     "line_number": int,
-{reasoning_example}    "is_genuine_secret": bool,
+        "is_genuine_secret": bool,
     "confidence_score": float,
     "remediation_priority": "..."
   }}
