@@ -1,0 +1,28 @@
+Support
+-------
+
+This project requires certain runtime environments and third-party tools to function correctly. 
+
+1. Runtime Environment Setups:
+   - Python 3.10 or higher: Required to run the backend scanner engine and API server.
+   - Node.js 18 or higher: Required to run the frontend Next.js application.
+   - npm (Node Package Manager): Included with Node.js, used for installing frontend dependencies.
+   - Python Virtual Environment (venv): Recommended for isolating Python dependencies.
+
+2. Third-Party Tools & Dependencies:
+
+   Backend (Python):
+   - pathspec: Used for gitignore style path matching.
+   - mlx-lm: Large language model inference library.
+   - pydantic: Data validation using Python type annotations.
+   (These are automatically installed via the backend/requirements.txt file)
+
+   Frontend (Node.js / React):
+   - Next.js: The core React framework used for the frontend application.
+   - React & React DOM: UI library for building the interface.
+   - TailwindCSS: Used for styling the application.
+   - Monaco Editor (@monaco-editor/react): Code editor component used in the interface.
+   - Framer Motion: Used for UI animations.
+   - Lucide React: Icon library.
+   - Base UI, Resizable Panels, clsx, tailwind-merge: Various utility and UI component libraries.
+   (These are automatically installed via the frontend/package.json file)

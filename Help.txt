@@ -1,0 +1,51 @@
+Help - User Manual
+------------------
+
+This manual provides a step-by-step guide on how to set up and run the Hybrid Secret Scanner project locally.
+
+Step 1: Check Prerequisites
+Ensure you have the following installed on your system:
+- Python 3.10 or higher
+- Node.js 18 or higher
+- npm (Node Package Manager)
+
+Step 2: Start the Backend API Server
+1. Open a terminal and navigate to the project's backend directory:
+   cd path/to/hybrid-secret-scanner/backend
+
+2. Create a Python virtual environment:
+   python3 -m venv .venv
+
+3. Activate the virtual environment:
+   - On macOS/Linux: source .venv/bin/activate
+   - On Windows: .\.venv\Scripts\activate
+
+4. Install the required Python dependencies:
+   python -m pip install -r requirements.txt
+
+5. Start the backend server:
+   LLM_DRY_RUN=true python api_server.py --host 127.0.0.1 --port 8000
+   (Keep this terminal open and running)
+
+Step 3: Start the Frontend Application
+1. Open a new, separate terminal window and navigate to the project's frontend directory:
+   cd path/to/hybrid-secret-scanner/frontend
+
+2. Install the required Node.js dependencies:
+   npm install
+
+3. Start the frontend development server:
+   npm run dev
+   (Keep this terminal open and running)
+
+Step 4: Access the Application
+1. Once both the backend and frontend servers are running, open your web browser.
+2. Navigate to: http://localhost:3000 (or the URL displayed in your frontend terminal).
+3. The interface will load, and you can begin using the application to scan code for secrets.
+
+Optional: Running a Command-Line Scan (CLI)
+If you prefer to scan a local directory directly from the command line without the web interface:
+1. Ensure your backend virtual environment is activated (see Step 2.3).
+2. Inside the backend directory, run the following command to scan the current directory:
+   python main.py .
+   (Or replace "." with the absolute path of the directory you wish to scan).
